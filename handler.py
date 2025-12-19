@@ -14,10 +14,6 @@ import tempfile
 import socket
 import traceback
 import logging
-import copy
-
-import numpy as np
-from PIL import Image
 
 from network_volume import (
     is_network_volume_debug_enabled,
@@ -29,70 +25,6 @@ from network_volume import (
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-DEFAULT_WORKFLOW_TEMPLATE = {
-    "6": {
-        "inputs": {"text": "", "clip": ["30", 1]},
-        "class_type": "CLIPTextEncode",
-        "_meta": {"title": "CLIP Text Encode (Positive Prompt)"},
-    },
-    "8": {
-        "inputs": {"samples": ["31", 0], "vae": ["30", 2]},
-        "class_type": "VAEDecode",
-        "_meta": {"title": "VAE Decode"},
-    },
-    "9": {
-        "inputs": {"filename_prefix": "ComfyUI", "images": ["8", 0]},
-        "class_type": "SaveImage",
-        "_meta": {"title": "Save Image"},
-    },
-    "27": {
-        "inputs": {"width": 512, "height": 512, "batch_size": 1},
-        "class_type": "EmptySD3LatentImage",
-        "_meta": {"title": "EmptySD3LatentImage"},
-    },
-    "30": {
-        "inputs": {"ckpt_name": "flux1-dev-fp8.safetensors"},
-        "class_type": "CheckpointLoaderSimple",
-        "_meta": {"title": "Load Checkpoint"},
-    },
-    "31": {
-        "inputs": {
-            "seed": 0,
-            "steps": 1,
-            "cfg": 1,
-            "sampler_name": "euler",
-            "scheduler": "simple",
-            "denoise": 1,
-            "model": ["30", 0],
-            "positive": ["35", 0],
-            "negative": ["33", 0],
-            "latent_image": ["27", 0],
-        },
-        "class_type": "KSampler",
-        "_meta": {"title": "KSampler"},
-    },
-    "33": {
-        "inputs": {"text": "", "clip": ["30", 1]},
-        "class_type": "CLIPTextEncode",
-        "_meta": {"title": "CLIP Text Encode (Negative Prompt)"},
-    },
-    "35": {
-        "inputs": {"guidance": 3.5, "conditioning": ["6", 0]},
-        "class_type": "FluxGuidance",
-        "_meta": {"title": "FluxGuidance"},
-    },
-    "38": {
-        "inputs": {"images": ["8", 0]},
-        "class_type": "PreviewImage",
-        "_meta": {"title": "Preview Image"},
-    },
-    "40": {
-        "inputs": {"filename_prefix": "ComfyUI", "images": ["8", 0]},
-        "class_type": "SaveImage",
-        "_meta": {"title": "Save Image"},
-    },
-}
 
 # Time to wait between API check attempts in milliseconds
 COMFY_API_AVAILABLE_INTERVAL_MS = 50
@@ -134,98 +66,6 @@ def _comfy_server_status():
         }
     except Exception as exc:
         return {"reachable": False, "error": str(exc)}
-
-
-def _deepcopy_workflow_template():
-    return copy.deepcopy(DEFAULT_WORKFLOW_TEMPLATE)
-
-
-def decode_base64_image(image_data):
-    if "," in image_data:
-        image_data = image_data.split(",", 1)[1]
-    try:
-        decoded = base64.b64decode(image_data)
-    except base64.binascii.Error as exc:  # pragma: no cover - validated earlier
-        raise ValueError(f"Invalid base64 image data: {exc}")
-    return Image.open(BytesIO(decoded))
-
-
-def remove_alpha_force_rgb(img: Image.Image) -> Image.Image:
-    if img.mode in ("P", "LA"):
-        img = img.convert("RGBA")
-
-    if img.mode == "RGBA":
-        arr = np.array(img, dtype=np.float32)
-        rgb = arr[..., :3].astype(np.float32)
-        a = arr[..., 3].astype(np.float32) / 255.0
-
-        h, w = a.shape
-        border = np.zeros((h, w), dtype=bool)
-        border[0, :] = True
-        border[-1, :] = True
-        border[:, 0] = True
-        border[:, -1] = True
-
-        mask = border & (a > 0.1)
-        if mask.any():
-            bg = np.median(rgb[mask], axis=0)
-        else:
-            bg = np.array([255.0, 255.0, 255.0], dtype=np.float32)
-
-        comp = rgb * a[..., None] + bg[None, None, :] * (1.0 - a[..., None])
-        out = np.clip(comp, 0, 255).astype(np.uint8)
-        return Image.fromarray(out, mode="RGB")
-
-    return img.convert("RGB")
-
-
-def resize_max_side(img: Image.Image, max_side: int) -> Image.Image:
-    w, h = img.size
-    scale = min(max_side / max(w, h), 1.0)
-    if scale < 1.0:
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
-        return img.resize((new_w, new_h), Image.LANCZOS)
-    return img
-
-
-def pil_to_base64_png_rgb(img: Image.Image) -> str:
-    img = img.convert("RGB")
-    buf = BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-def build_workflow_from_params(prompt, guidance_scale, steps, seed, width, height):
-    workflow = _deepcopy_workflow_template()
-    workflow["6"]["inputs"]["text"] = prompt
-    workflow["27"]["inputs"]["width"] = width
-    workflow["27"]["inputs"]["height"] = height
-    workflow["31"]["inputs"]["seed"] = seed
-    workflow["31"]["inputs"]["steps"] = steps
-    workflow["35"]["inputs"]["guidance"] = guidance_scale
-    return workflow
-
-
-def prepare_parameterized_request(validated_params):
-    raw_image = decode_base64_image(validated_params["image"])
-    rgb_image = remove_alpha_force_rgb(raw_image)
-    longest_side = max(rgb_image.size)
-    target_max_side = min(int(validated_params["max_size"]), longest_side)
-    resized = resize_max_side(rgb_image, target_max_side)
-
-    workflow = build_workflow_from_params(
-        validated_params["prompt"],
-        validated_params["guidance_scale"],
-        validated_params["steps"],
-        validated_params["seed"],
-        resized.size[0],
-        resized.size[1],
-    )
-
-    processed_image = pil_to_base64_png_rgb(resized)
-    images = [{"name": "input.png", "image": processed_image}]
-    return workflow, images, resized.size
 
 
 def _attempt_websocket_reconnect(ws_url, max_attempts, delay_s, initial_error):
@@ -321,55 +161,30 @@ def validate_input(job_input):
         except json.JSONDecodeError:
             return None, "Invalid JSON format in input"
 
-    # Legacy workflow path
+    # Validate 'workflow' in input
     workflow = job_input.get("workflow")
-    if workflow is not None:
-        images = job_input.get("images")
-        if images is not None:
-            if not isinstance(images, list) or not all(
-                "name" in image and "image" in image for image in images
-            ):
-                return (
-                    None,
-                    "'images' must be a list of objects with 'name' and 'image' keys",
-                )
+    if workflow is None:
+        return None, "Missing 'workflow' parameter"
 
-        comfy_org_api_key = job_input.get("comfy_org_api_key")
-        return {
-            "workflow": workflow,
-            "images": images,
-            "comfy_org_api_key": comfy_org_api_key,
-        }, None
+    # Validate 'images' in input, if provided
+    images = job_input.get("images")
+    if images is not None:
+        if not isinstance(images, list) or not all(
+            "name" in image and "image" in image for image in images
+        ):
+            return (
+                None,
+                "'images' must be a list of objects with 'name' and 'image' keys",
+            )
 
-    required_fields = ["image", "prompt", "guidance_scale", "steps", "seed", "max_size"]
-    missing_fields = [field for field in required_fields if field not in job_input]
-    if missing_fields:
-        return None, f"Missing required parameter(s): {', '.join(missing_fields)}"
+    # Optional: API key for Comfy.org API Nodes, passed per-request
+    comfy_org_api_key = job_input.get("comfy_org_api_key")
 
-    try:
-        steps = int(job_input["steps"])
-        seed = int(job_input["seed"])
-        guidance_scale = float(job_input["guidance_scale"])
-        max_size = int(job_input["max_size"])
-    except (TypeError, ValueError):
-        return None, "Invalid parameter types for steps, seed, guidance_scale, or max_size"
-
-    if steps <= 0 or max_size <= 0:
-        return None, "'steps' and 'max_size' must be positive"
-
-    prompt = job_input["prompt"]
-    if not isinstance(prompt, str) or not prompt.strip():
-        return None, "'prompt' must be a non-empty string"
-
+    # Return validated data and no error
     return {
-        "workflow_params": {
-            "image": job_input["image"],
-            "prompt": prompt,
-            "guidance_scale": guidance_scale,
-            "steps": steps,
-            "seed": seed,
-            "max_size": max_size,
-        }
+        "workflow": workflow,
+        "images": images,
+        "comfy_org_api_key": comfy_org_api_key,
     }, None
 
 
@@ -713,20 +528,9 @@ def handler(job):
     if error_message:
         return {"error": error_message}
 
-    workflow = validated_data.get("workflow")
+    # Extract validated data
+    workflow = validated_data["workflow"]
     input_images = validated_data.get("images")
-    target_dimensions = None
-
-    if workflow is None and "workflow_params" in validated_data:
-        try:
-            workflow, input_images, target_dimensions = prepare_parameterized_request(
-                validated_data["workflow_params"]
-            )
-        except Exception as exc:
-            return {"error": f"Invalid input data: {exc}"}
-
-    if workflow is None:
-        return {"error": "Missing workflow data"}
 
     # Make sure that the ComfyUI HTTP API is available before proceeding
     if not check_server(
@@ -949,14 +753,9 @@ def handler(job):
                         else:
                             # Return as base64 string
                             try:
-                                processed = remove_alpha_force_rgb(
-                                    Image.open(BytesIO(image_bytes))
+                                base64_image = base64.b64encode(image_bytes).decode(
+                                    "utf-8"
                                 )
-                                if target_dimensions:
-                                    processed = processed.resize(
-                                        target_dimensions, Image.LANCZOS
-                                    )
-                                base64_image = pil_to_base64_png_rgb(processed)
                                 # Append dictionary with filename and base64 data
                                 output_data.append(
                                     {
